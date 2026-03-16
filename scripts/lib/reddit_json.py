@@ -64,7 +64,7 @@ def search_reddit(
     to_date: str,
     depth: str = "default",
     mock: bool = False,
-) -> Tuple[List[RedditItem], Dict[str, Any], Optional[str]]:
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Optional[str]]:
     """Search Reddit using public JSON API.
 
     Args:
@@ -75,7 +75,7 @@ def search_reddit(
         mock: If True, return empty (for testing)
 
     Returns:
-        Tuple of (items, raw_response, error_string_or_None)
+        Tuple of (items_as_dicts, raw_response, error_string_or_None)
     """
     if mock:
         return [], {}, None
@@ -125,8 +125,8 @@ def search_reddit(
 def _parse_reddit_items(
     raw_items: List[Dict],
     query: str,
-) -> List[RedditItem]:
-    """Parse Reddit JSON listing into RedditItem list."""
+) -> List[Dict[str, Any]]:
+    """Parse Reddit JSON listing into dict list (matching openai_reddit output)."""
     results = []
 
     for child in raw_items:
@@ -154,39 +154,39 @@ def _parse_reddit_items(
             except (ValueError, OSError):
                 pass
 
-        # Engagement
-        engagement = Engagement(
-            score=post.get("score", 0),
-            num_comments=post.get("num_comments", 0),
-            upvote_ratio=post.get("upvote_ratio"),
-        )
-
         # Relevance
         full_text = f"{title} {post.get('selftext', '')[:500]}"
         rel = _compute_relevance(full_text, query) if query else 0.5
 
-        item = RedditItem(
-            id=post_id,
-            title=title,
-            url=url,
-            subreddit=subreddit,
-            date=date_iso,
-            date_confidence="high" if date_iso else "low",
-            engagement=engagement,
-            relevance=rel,
-            why_relevant=f"matched: {query}" if rel > 0.3 else "",
-        )
+        item = {
+            "id": post_id,
+            "title": title,
+            "url": url,
+            "subreddit": subreddit,
+            "date": date_iso,
+            "date_confidence": "high" if date_iso else "low",
+            "engagement": {
+                "score": post.get("score", 0),
+                "num_comments": post.get("num_comments", 0),
+                "upvote_ratio": post.get("upvote_ratio"),
+            },
+            "top_comments": [],
+            "comment_insights": [],
+            "relevance": rel,
+            "why_relevant": f"matched: {query}" if rel > 0.3 else "",
+        }
         results.append(item)
 
     return results
 
 
-def _enrich_with_comments(item: RedditItem):
-    """Fetch top comments for a Reddit post."""
-    if not item.url:
+def _enrich_with_comments(item: Dict[str, Any]):
+    """Fetch top comments for a Reddit post dict."""
+    url = item.get("url", "")
+    if not url:
         return
 
-    comments_url = f"{item.url}.json?limit=5&sort=top"
+    comments_url = f"{url}.json?limit=5&sort=top"
     data = _fetch_json(comments_url, timeout=10)
 
     if not data or not isinstance(data, list) or len(data) < 2:
@@ -205,10 +205,10 @@ def _enrich_with_comments(item: RedditItem):
         if len(body) < 10:
             continue
 
-        item.top_comments.append(Comment(
-            excerpt=body[:500],
-            author=author,
-            score=score,
-            date=None,
-            url=f"https://www.reddit.com{comment.get('permalink', '')}",
-        ))
+        item["top_comments"].append({
+            "excerpt": body[:500],
+            "author": author,
+            "score": score,
+            "date": None,
+            "url": f"https://www.reddit.com{comment.get('permalink', '')}",
+        })

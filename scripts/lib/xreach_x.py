@@ -123,15 +123,15 @@ def search_handles(
 def parse_xreach_response(
     response: Dict[str, Any],
     query: str = "",
-) -> List[XItem]:
-    """Parse xreach JSON into normalized XItem list.
+) -> List[Dict[str, Any]]:
+    """Parse xreach JSON into normalized dict list (matching bird_x output format).
 
     Args:
         response: Raw xreach JSON response
         query: Original query for relevance scoring
 
     Returns:
-        List of XItem instances.
+        List of dicts matching the format expected by normalize.normalize_x_items().
     """
     items = response.get("items", [])
     results = []
@@ -148,7 +148,6 @@ def parse_xreach_response(
             continue
 
         # Build URL
-        # xreach doesn't always include full user info, construct URL from ID
         url = f"https://x.com/i/status/{tweet_id}"
 
         # Parse date
@@ -161,33 +160,30 @@ def parse_xreach_response(
             except ValueError:
                 date_iso = date_str[:10] if len(date_str) >= 10 else None
 
-        # Engagement
-        engagement = Engagement(
-            likes=raw.get("likeCount", 0),
-            reposts=raw.get("retweetCount", 0),
-            replies=raw.get("replyCount", 0),
-            quotes=raw.get("quoteCount", 0),
-            views=raw.get("viewCount", 0),
-        )
-
-        # Author handle — xreach may not include screen_name directly
+        # Author handle
         author = raw.get("user", {})
         handle = author.get("screenName", author.get("screen_name", f"id:{author.get('restId', tweet_id)}"))
 
         # Relevance
         rel = _compute_relevance(text, query) if query else 0.5
 
-        item = XItem(
-            id=tweet_id,
-            text=text,
-            url=url,
-            author_handle=handle,
-            date=date_iso,
-            date_confidence="high" if date_iso else "low",
-            engagement=engagement,
-            relevance=rel,
-            why_relevant=f"matched query: {query}" if rel > 0.3 else "",
-        )
+        item = {
+            "id": tweet_id,
+            "text": text,
+            "url": url,
+            "author_handle": handle,
+            "date": date_iso,
+            "date_confidence": "high" if date_iso else "low",
+            "engagement": {
+                "likes": raw.get("likeCount", 0),
+                "reposts": raw.get("retweetCount", 0),
+                "replies": raw.get("replyCount", 0),
+                "quotes": raw.get("quoteCount", 0),
+                "views": raw.get("viewCount", 0),
+            },
+            "relevance": rel,
+            "why_relevant": f"matched query: {query}" if rel > 0.3 else "",
+        }
         results.append(item)
 
     return results

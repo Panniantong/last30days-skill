@@ -1676,14 +1676,16 @@ def main():
     # Check available sources (accounting for Bird auto-detection)
     available = env.get_available_sources(config)
 
-    # Override available if Bird provides X
-    if x_source == 'bird':
+    # Override available if Bird or xreach provides X
+    if x_source in ('bird', 'xreach'):
         if available == 'reddit':
             available = 'both'  # Now have both Reddit + X
         elif available == 'reddit-web':
             available = 'all'  # Reddit + X + Web
         elif available == 'web':
             available = 'x-web'  # X + Web
+        elif available == 'none':
+            available = 'x'  # At least have X
 
     # Mock mode can work without keys
     if args.mock:
