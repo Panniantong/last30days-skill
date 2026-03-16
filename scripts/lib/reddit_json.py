@@ -1,0 +1,214 @@
+"""Reddit search via public JSON API (Agent Reach free backend).
+
+Uses Reddit's public JSON endpoints for search and thread retrieval.
+No API key needed — just HTTP calls via stdlib urllib.
+Replaces reddit.py / openai_reddit.py as a free alternative.
+
+Note: Server IPs may get 403 from Reddit. Falls back gracefully.
+"""
+
+import json
+import sys
+import urllib.request
+import urllib.parse
+import urllib.error
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+from .schema import Comment, Engagement, RedditItem
+from .relevance import token_overlap_relevance as _compute_relevance
+from .query import extract_core_subject
+
+# Reddit JSON API endpoints
+REDDIT_SEARCH_URL = "https://www.reddit.com/search.json"
+REDDIT_THREAD_URL = "https://www.reddit.com"
+
+USER_AGENT = "agent-reach/1.0 (research-skill; https://github.com/Panniantong/Agent-Reach)"
+
+# Depth configurations
+DEPTH_CONFIG = {
+    "quick": 10,
+    "default": 25,
+    "deep": 50,
+}
+
+
+def _log(msg: str):
+    sys.stderr.write(f"[reddit-json] {msg}\n")
+    sys.stderr.flush()
+
+
+def _fetch_json(url: str, timeout: int = 15) -> Optional[Dict]:
+    """Fetch JSON from a URL with proper User-Agent."""
+    req = urllib.request.Request(url, headers={
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        _log(f"HTTP {e.code} from {url}")
+        return None
+    except urllib.error.URLError as e:
+        _log(f"URL error: {e.reason}")
+        return None
+    except Exception as e:
+        _log(f"Fetch error: {e}")
+        return None
+
+
+def search_reddit(
+    topic: str,
+    from_date: str,
+    to_date: str,
+    depth: str = "default",
+    mock: bool = False,
+) -> Tuple[List[RedditItem], Dict[str, Any], Optional[str]]:
+    """Search Reddit using public JSON API.
+
+    Args:
+        topic: Search topic
+        from_date: Start date (YYYY-MM-DD) — used for time filter
+        to_date: End date (YYYY-MM-DD)
+        depth: "quick", "default", or "deep"
+        mock: If True, return empty (for testing)
+
+    Returns:
+        Tuple of (items, raw_response, error_string_or_None)
+    """
+    if mock:
+        return [], {}, None
+
+    count = DEPTH_CONFIG.get(depth, DEPTH_CONFIG["default"])
+    core_topic = extract_core_subject(topic, max_words=6, strip_suffixes=True)
+
+    _log(f"Searching Reddit: {core_topic} (limit={count})")
+
+    # Build search URL
+    params = urllib.parse.urlencode({
+        "q": core_topic,
+        "limit": min(count, 100),  # Reddit caps at 100
+        "t": "month",
+        "sort": "relevance",
+        "type": "link",
+    })
+    url = f"{REDDIT_SEARCH_URL}?{params}"
+
+    data = _fetch_json(url, timeout=20)
+    if data is None:
+        return [], {}, "Reddit API returned no data (possibly blocked by IP)"
+
+    raw_items = data.get("data", {}).get("children", [])
+    if not raw_items:
+        # Retry with broader time range
+        params_retry = urllib.parse.urlencode({
+            "q": core_topic,
+            "limit": min(count, 100),
+            "t": "year",
+            "sort": "relevance",
+            "type": "link",
+        })
+        url_retry = f"{REDDIT_SEARCH_URL}?{params_retry}"
+        data = _fetch_json(url_retry, timeout=20) or {}
+        raw_items = data.get("data", {}).get("children", [])
+
+    items = _parse_reddit_items(raw_items, core_topic)
+
+    # Try to enrich top items with comments
+    for item in items[:5]:
+        _enrich_with_comments(item)
+
+    return items, data, None
+
+
+def _parse_reddit_items(
+    raw_items: List[Dict],
+    query: str,
+) -> List[RedditItem]:
+    """Parse Reddit JSON listing into RedditItem list."""
+    results = []
+
+    for child in raw_items:
+        post = child.get("data", {})
+        post_id = post.get("id", "")
+        title = post.get("title", "")
+        subreddit = post.get("subreddit", "")
+        permalink = post.get("permalink", "")
+
+        if not post_id or not title:
+            continue
+
+        # Skip removed/deleted
+        if post.get("removed_by_category") or post.get("selftext") == "[removed]":
+            continue
+
+        url = f"https://www.reddit.com{permalink}" if permalink else ""
+
+        # Date
+        created_utc = post.get("created_utc", 0)
+        date_iso = None
+        if created_utc:
+            try:
+                date_iso = datetime.utcfromtimestamp(created_utc).strftime("%Y-%m-%d")
+            except (ValueError, OSError):
+                pass
+
+        # Engagement
+        engagement = Engagement(
+            score=post.get("score", 0),
+            num_comments=post.get("num_comments", 0),
+            upvote_ratio=post.get("upvote_ratio"),
+        )
+
+        # Relevance
+        full_text = f"{title} {post.get('selftext', '')[:500]}"
+        rel = _compute_relevance(full_text, query) if query else 0.5
+
+        item = RedditItem(
+            id=post_id,
+            title=title,
+            url=url,
+            subreddit=subreddit,
+            date=date_iso,
+            date_confidence="high" if date_iso else "low",
+            engagement=engagement,
+            relevance=rel,
+            why_relevant=f"matched: {query}" if rel > 0.3 else "",
+        )
+        results.append(item)
+
+    return results
+
+
+def _enrich_with_comments(item: RedditItem):
+    """Fetch top comments for a Reddit post."""
+    if not item.url:
+        return
+
+    comments_url = f"{item.url}.json?limit=5&sort=top"
+    data = _fetch_json(comments_url, timeout=10)
+
+    if not data or not isinstance(data, list) or len(data) < 2:
+        return
+
+    comments_listing = data[1].get("data", {}).get("children", [])
+
+    for child in comments_listing[:3]:
+        comment = child.get("data", {})
+        body = comment.get("body", "")
+        score = comment.get("score", 0)
+        author = comment.get("author", "")
+
+        if not body or author in ("[deleted]", "AutoModerator"):
+            continue
+        if len(body) < 10:
+            continue
+
+        item.top_comments.append(Comment(
+            excerpt=body[:500],
+            author=author,
+            score=score,
+            date=None,
+            url=f"https://www.reddit.com{comment.get('permalink', '')}",
+        ))

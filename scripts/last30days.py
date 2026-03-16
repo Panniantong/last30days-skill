@@ -159,6 +159,9 @@ from lib import (
     instagram,
     websearch,
     xai_x,
+    xreach_x,       # Agent Reach free backend for X/Twitter
+    reddit_json,     # Agent Reach free backend for Reddit
+    exa_search,      # Agent Reach free backend for web search
     youtube_yt,
     query_type as qt,
 )
@@ -195,9 +198,24 @@ def _search_reddit(
     used_scrapecreators = False
 
     sc_token = config.get("SCRAPECREATORS_API_KEY")
+    openai_key = config.get("OPENAI_API_KEY")
 
     if mock:
         raw_response = load_fixture("openai_sample.json")
+    elif not sc_token and not openai_key:
+        # === Agent Reach free backend (no API keys needed) ===
+        sys.stderr.write("[Reddit] Using free JSON API (agent-reach backend)\n")
+        sys.stderr.flush()
+        try:
+            items, raw_response, err = reddit_json.search_reddit(
+                topic, from_date, to_date, depth=depth,
+            )
+            if err:
+                reddit_error = err
+            return items, raw_response or {}, reddit_error, False
+        except Exception as e:
+            reddit_error = f"{type(e).__name__}: {e}"
+            return [], {}, reddit_error, False
     elif sc_token:
         # === ScrapeCreators path (preferred) ===
         used_scrapecreators = True
@@ -324,10 +342,10 @@ def _search_x(
     mock: bool,
     x_source: str = "xai",
 ) -> tuple:
-    """Search X via Bird CLI or xAI (runs in thread).
+    """Search X via xreach, Bird CLI, ScrapeCreators, or xAI (runs in thread).
 
     Args:
-        x_source: 'bird' or 'xai' - which backend to use
+        x_source: 'xreach', 'bird', 'scrapecreators', or 'xai'
 
     Returns:
         Tuple of (x_items, raw_response, error)
@@ -338,6 +356,23 @@ def _search_x(
     if mock:
         raw_response = load_fixture("xai_sample.json")
         x_items = xai_x.parse_x_response(raw_response or {})
+        return x_items, raw_response, x_error
+
+    # Use xreach (Agent Reach free backend) if specified
+    if x_source == "xreach":
+        try:
+            raw_response = xreach_x.search_x(
+                topic, from_date, to_date, depth=depth,
+            )
+        except Exception as e:
+            raw_response = {"error": str(e)}
+            x_error = f"{type(e).__name__}: {e}"
+
+        x_items = xreach_x.parse_xreach_response(raw_response or {}, query=topic)
+
+        if raw_response and isinstance(raw_response, dict) and raw_response.get("error") and not x_error:
+            x_error = raw_response["error"]
+
         return x_items, raw_response, x_error
 
     # Use Bird if specified
@@ -621,6 +656,19 @@ def _search_web(
 
     backend = env.get_web_search_source(config)
     if not backend:
+        # Fallback to Exa (Agent Reach free backend) if no paid keys
+        if exa_search.is_exa_installed():
+            sys.stderr.write("[Web] Using Exa via mcporter (agent-reach free backend)\n")
+            sys.stderr.flush()
+            try:
+                exa_items = exa_search.search_web(topic, from_date, to_date, depth=depth)
+                # Convert WebSearchItem to raw dicts for normalize
+                raw_results = []
+                for item in exa_items:
+                    raw_results.append(item.to_dict())
+                return raw_results, None
+            except Exception as e:
+                return [], f"Exa: {type(e).__name__}: {e}"
         return [], "No web search API keys configured"
 
     web_error = None
@@ -1540,9 +1588,13 @@ def main():
     # Inject .env credentials into Bird module before auth check
     bird_x.set_credentials(config.get('AUTH_TOKEN'), config.get('CT0'))
 
-    # Auto-detect Bird (no prompts - just use it if available)
-    x_source_status = env.get_x_source_status(config)
-    x_source = x_source_status["source"]  # 'bird', 'xai', or None
+    # Auto-detect X source: prefer xreach (free) > bird > xai > scrapecreators
+    if xreach_x.is_xreach_installed():
+        x_source = "xreach"
+        x_source_status = {"source": "xreach", "bird_installed": False, "bird_authenticated": False}
+    else:
+        x_source_status = env.get_x_source_status(config)
+        x_source = x_source_status["source"]  # 'bird', 'xai', or None
 
     # Auto-detect yt-dlp for YouTube search
     has_ytdlp = env.is_ytdlp_available()
