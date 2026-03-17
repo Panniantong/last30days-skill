@@ -8,6 +8,7 @@ Note: Server IPs may get 403 from Reddit. Falls back gracefully.
 """
 
 import json
+import os
 import sys
 import urllib.request
 import urllib.parse
@@ -15,7 +16,6 @@ import urllib.error
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from .schema import Comment, Engagement, RedditItem
 from .relevance import token_overlap_relevance as _compute_relevance
 from .query import extract_core_subject
 
@@ -24,6 +24,9 @@ REDDIT_SEARCH_URL = "https://www.reddit.com/search.json"
 REDDIT_THREAD_URL = "https://www.reddit.com"
 
 USER_AGENT = "agent-reach/1.0 (research-skill; https://github.com/Panniantong/Agent-Reach)"
+
+# Proxy config — load from shared config if available
+_PROXY_ENV_FILE = os.path.expanduser("~/.openclaw/shared-config/proxy.env")
 
 # Depth configurations
 DEPTH_CONFIG = {
@@ -38,14 +41,59 @@ def _log(msg: str):
     sys.stderr.flush()
 
 
+def _get_proxy_url() -> Optional[str]:
+    """Get proxy URL from env or shared config file."""
+    # Check env first
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+    if proxy:
+        return proxy
+
+    # Try loading from shared config (handles export and $VAR references)
+    if os.path.exists(_PROXY_ENV_FILE):
+        try:
+            values = {}
+            with open(_PROXY_ENV_FILE) as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("#") or "=" not in line:
+                        continue
+                    # Strip 'export '
+                    if line.startswith("export "):
+                        line = line[7:]
+                    key, val = line.split("=", 1)
+                    key = key.strip()
+                    val = val.strip().strip('"').strip("'")
+                    # Resolve $VAR references
+                    for ref_key, ref_val in values.items():
+                        val = val.replace(f"${ref_key}", ref_val)
+                    values[key] = val
+
+            return values.get("HTTPS_PROXY") or values.get("HTTP_PROXY") or values.get("PROXY_URL")
+        except Exception:
+            pass
+    return None
+
+
 def _fetch_json(url: str, timeout: int = 15) -> Optional[Dict]:
-    """Fetch JSON from a URL with proper User-Agent."""
+    """Fetch JSON from a URL with proper User-Agent, using proxy if available."""
     req = urllib.request.Request(url, headers={
         "User-Agent": USER_AGENT,
         "Accept": "application/json",
     })
+
+    # Set up proxy handler
+    proxy_url = _get_proxy_url()
+    if proxy_url:
+        proxy_handler = urllib.request.ProxyHandler({
+            "http": proxy_url,
+            "https": proxy_url,
+        })
+        opener = urllib.request.build_opener(proxy_handler)
+    else:
+        opener = urllib.request.build_opener()
+
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         _log(f"HTTP {e.code} from {url}")
